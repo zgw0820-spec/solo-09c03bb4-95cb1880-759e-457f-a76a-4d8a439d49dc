@@ -111,22 +111,32 @@ def main() -> int:
         check(st["current_version"] == "v2" and not st["fail_marker_present"],
               "old version still active, fail marker cleaned up", str(st))
 
-        print("== double start rejected ==")
-        # Wait for the previous recorder to finish first; then a concurrent
-        # second start must be rejected (one-connection-per-run guarantee).
+        print("== recorder slots: two concurrent allowed, third rejected ==")
+        # Wait for the previous recorder to finish first; the gateway now
+        # allows two simultaneous simulated recorders (one per slot).
         idle_deadline = time.monotonic() + 15
         while time.monotonic() < idle_deadline:
             if not call("GET", base + "/api/status")["recorder_alive"]:
                 break
             time.sleep(0.3)
-        call("POST", base + "/api/recorder/start",
-             {"count": 5, "interval": 0.1, "gap_at": 0, "gap_seconds": 0})
+        r1 = call("POST", base + "/api/recorder/start",
+                  {"count": 30, "interval": 0.2, "gap_at": 0, "gap_seconds": 0,
+                   "recorder_id": "r1"})
+        check(r1.get("ok"), "first recorder start accepted", str(r1))
+        r2 = call("POST", base + "/api/recorder/start",
+                  {"count": 30, "interval": 0.2, "gap_at": 0, "gap_seconds": 0,
+                   "recorder_id": "r2"})
+        check(r2.get("ok"), "second concurrent recorder accepted", str(r2))
         dup = call("POST", base + "/api/recorder/start",
                    {"count": 5, "interval": 0.1, "gap_at": 0, "gap_seconds": 0})
-        check(dup.get("ok") is False, "concurrent recorder start rejected",
+        check(dup.get("ok") is False, "third concurrent recorder rejected",
               str(dup))
+        st = call("GET", base + "/api/status")
+        check(sum(1 for r in st["recorders"] if r["alive"]) == 2,
+              "status reports two live recorders", str(st["recorders"]))
         stop = call("POST", base + "/api/recorder/stop")
-        check(stop.get("ok"), "recorder stopped via API", str(stop))
+        check(stop.get("ok") and set(stop.get("stopped", [])) == {"r1", "r2"},
+              "both recorders stopped via API", str(stop))
 
         print("== events API cursor pagination ==")
         page1 = call("GET", base + "/api/events?cursor=0")

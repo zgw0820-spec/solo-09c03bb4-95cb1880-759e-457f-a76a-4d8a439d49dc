@@ -21,6 +21,13 @@ Upgrade flow (the recorder's TCP connection never drops):
 
 Ack rule: one ``ack`` event per reading id, each id acked exactly once --
 the successor drains its handed-over partial buffer before reading more.
+
+Per-connection pause: the supervisor may tell the collector to stop
+reading one TCP connection (``pause_conn``). The connection stays open,
+its already-read partial line stays buffered, no new acks are emitted
+for it, and the pause survives handover (the flag travels with the fd).
+``resume_conn`` re-arms reading: the preserved partial line is completed
+first, then readings continue in send order.
 """
 from __future__ import annotations
 
@@ -66,13 +73,19 @@ class Collector:
     # ------------------------------------------------------------------ #
     # Connection bookkeeping
     # ------------------------------------------------------------------ #
-    def add_conn(self, fd: int, leftover: bytes = b"", peer: str = "") -> None:
+    def add_conn(self, fd: int, leftover: bytes = b"", peer: str = "",
+                 paused: bool = False) -> None:
         sock = socket.socket(fileno=fd)
         self.conns[fd] = {
             "sock": sock,
             "buf": bytearray(leftover),
             "peer": peer,
             "closed": False,
+            # Paused connections are kept open (fd + already-read partial
+            # line stay right here) but are excluded from the read loop,
+            # so the gateway stops reading this TCP connection and no new
+            # acks are produced for it until a resume arrives.
+            "paused": paused,
         }
 
     def close_conn(self, fd: int) -> None:
@@ -107,7 +120,12 @@ class Collector:
 
         while self.running:
             watches = [self.control]
-            watches.extend(e["sock"] for e in self.conns.values())
+            # Paused connections are deliberately not watched: the gateway
+            # stops reading those TCP connections (backpressure builds up
+            # in the kernel buffer) while every other connection is read
+            # and acked as usual.
+            watches.extend(e["sock"] for e in self.conns.values()
+                           if not e.get("paused"))
             try:
                 readable, _, _ = select.select(watches, [], [], 1.0)
             except OSError:
@@ -147,9 +165,16 @@ class Collector:
                 return
             fd = fds[0]
             leftover = frame.get("leftover", "").encode("latin-1")
-            self.add_conn(fd, leftover=leftover, peer=frame.get("peer", ""))
+            paused = bool(frame.get("paused", False))
+            self.add_conn(fd, leftover=leftover, peer=frame.get("peer", ""),
+                          paused=paused)
             self.log(f"accepted recorder connection fd={fd}, "
-                     f"leftover={len(leftover)} byte(s)")
+                     f"leftover={len(leftover)} byte(s)"
+                     + (", paused" if paused else ""))
+        elif ftype == "pause_conn":
+            self.set_paused(frame.get("peer", ""), True)
+        elif ftype == "resume_conn":
+            self.set_paused(frame.get("peer", ""), False)
         elif ftype == "takeover":
             if not fds:
                 self.log("takeover without successor fd, refused")
@@ -163,6 +188,39 @@ class Collector:
             self.log(f"unknown control frame: {ftype!r}")
 
     # ------------------------------------------------------------------ #
+    # Per-connection pause / resume (ordered on the same control channel
+    # as takeover, so a pause sent before an upgrade is always applied
+    # before the handover runs)
+    # ------------------------------------------------------------------ #
+    def set_paused(self, peer: str, paused: bool) -> None:
+        matched = False
+        for entry in list(self.conns.values()):
+            if entry.get("peer") != peer:
+                continue
+            matched = True
+            if entry.get("paused") == paused:
+                continue
+            entry["paused"] = paused
+            if paused:
+                # Effective now: this fd leaves the read loop, so no more
+                # acks for this connection. Bytes already read (including
+                # a partial line) stay in `buf`; bytes still in the kernel
+                # buffer stay with the fd.
+                self.emit({"type": "conn_paused", "peer": peer,
+                           "leftover_bytes": len(entry["buf"])})
+            else:
+                self.emit({"type": "conn_resumed", "peer": peer,
+                           "leftover_bytes": len(entry["buf"])})
+                # Finish whatever is already buffered (the preserved
+                # partial line first), then keep reading the same TCP
+                # connection in send order -- one ack per reading, as before.
+                self.drain_available(entry)
+        if not matched:
+            self.emit({"type": "pause_nack", "peer": peer,
+                       "reason": "unknown connection",
+                       "wanted": "pause" if paused else "resume"})
+
+    # ------------------------------------------------------------------ #
     # Handover: drain complete readings, pass the live fd to the successor
     # ------------------------------------------------------------------ #
     def do_handover(self, successor_fd: int, new_version: str) -> None:
@@ -172,11 +230,18 @@ class Collector:
         # 1. Finish every reading whose full JSON line is already buffered,
         #    and pull any further complete lines already delivered into the
         #    kernel buffer. A partial last line stays in `buf` and travels
-        #    with the fd to the successor.
+        #    with the fd to the successor. Paused connections are NOT
+        #    drained: a pause means no new acks for that connection, so
+        #    their partial line travels as-is and the pause stays in
+        #    effect across the upgrade.
         for entry in list(self.conns.values()):
+            if entry.get("paused"):
+                continue
             self.drain_available(entry)
 
-        # 2. Forward each live connection: same TCP fd + unprocessed bytes.
+        # 2. Forward each live connection: same TCP fd + unprocessed bytes
+        #    + the pause flag, so the successor keeps paused connections
+        #    paused without reading them.
         forwarded = 0
         try:
             for fd, entry in list(self.conns.items()):
@@ -186,7 +251,8 @@ class Collector:
                 send_frame(
                     successor,
                     {"type": "new_conn", "peer": entry.get("peer", ""),
-                     "leftover": bytes(entry["buf"]).decode("latin-1")},
+                     "leftover": bytes(entry["buf"]).decode("latin-1"),
+                     "paused": bool(entry.get("paused"))},
                     fds=[sock.fileno()],
                 )
                 forwarded += 1
@@ -250,6 +316,11 @@ class Collector:
     def handle_data(self, sock: socket.socket) -> None:
         entry = self.conns.get(sock.fileno())
         if entry is None:
+            return
+        if entry.get("closed"):
+            # EOF was already consumed (e.g. detected by the resume drain);
+            # just release our reference.
+            self.close_conn(sock.fileno())
             return
         try:
             chunk = sock.recv(65536)

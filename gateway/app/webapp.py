@@ -33,6 +33,16 @@ class RecorderReq(BaseModel):
     interval: float = Field(0.2, ge=0.01, le=10)
     gap_at: int = Field(20, ge=0)
     gap_seconds: float = Field(4.0, ge=0, le=120)
+    recorder_id: str | None = Field(None, max_length=32)
+    sensor: str | None = Field(None, max_length=64)
+
+
+class StopRecorderReq(BaseModel):
+    recorder_id: str | None = Field(None, max_length=32)
+
+
+class PauseReq(BaseModel):
+    peer: str = Field(..., examples=["127.0.0.1:51234"])
 
 
 class FailMarkerReq(BaseModel):
@@ -72,15 +82,34 @@ def post_upgrade(req: UpgradeReq) -> dict:
 @app.post("/api/recorder/start")
 def post_recorder_start(req: RecorderReq) -> dict:
     result = sup().start_recorder(req.count, req.interval,
-                                  req.gap_at, req.gap_seconds)
+                                  req.gap_at, req.gap_seconds,
+                                  recorder_id=req.recorder_id,
+                                  sensor=req.sensor)
     if not result.get("ok"):
         return JSONResponse(result, status_code=409)
     return result
 
 
 @app.post("/api/recorder/stop")
-def post_recorder_stop() -> dict:
-    result = sup().stop_recorder()
+def post_recorder_stop(req: StopRecorderReq | None = None) -> dict:
+    result = sup().stop_recorder(req.recorder_id if req else None)
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=409)
+    return result
+
+
+@app.post("/api/connections/pause")
+def post_conn_pause(req: PauseReq) -> dict:
+    result = sup().set_pause(req.peer, True)
+    if not result.get("ok"):
+        # 409 + retry=true means "handover in progress, try again".
+        return JSONResponse(result, status_code=409)
+    return result
+
+
+@app.post("/api/connections/resume")
+def post_conn_resume(req: PauseReq) -> dict:
+    result = sup().set_pause(req.peer, False)
     if not result.get("ok"):
         return JSONResponse(result, status_code=409)
     return result

@@ -1,4 +1,4 @@
-/* Operation page logic: poll status/events, drive recorder & upgrade APIs. */
+/* Operation page logic: poll status/events, drive recorder, pause/resume & upgrade APIs. */
 const $ = (id) => document.getElementById(id);
 let cursor = 0;
 
@@ -15,7 +15,11 @@ async function api(path, opts = {}) {
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || data.detail || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data.error || data.detail || `HTTP ${res.status}`);
+    err.retry = !!data.retry;
+    throw err;
+  }
   return data;
 }
 
@@ -42,7 +46,7 @@ function renderStatus(s) {
       <span class="k">当前采集进程</span><span>${versionBadge(s.current_version)}</span>
       <span class="k">换版状态</span><span>${busy}</span>
       <span class="k">记录仪进程</span>
-      <span class="badge ${s.recorder_alive ? "on" : "off"}">${s.recorder_alive ? "运行中（单连接）" : "未运行/已结束"}</span>
+      <span class="badge ${s.recorder_alive ? "on" : "off"}">${s.recorder_alive ? `运行中（${(s.recorders || []).filter((r) => r.alive).length} 台）` : "未运行/已结束"}</span>
       <span class="k">TCP 接受连接总数</span><span>${s.tcp_connections_accepted_total}</span>
       <span class="k">失败标记</span>
       <span class="badge ${s.fail_marker_present ? "busy" : "off"}">${s.fail_marker_present ? "存在" : "无"}</span>
@@ -51,6 +55,71 @@ function renderStatus(s) {
     </div>
     ${gens}
     <div style="margin-top:8px">${connInfo}</div>`;
+
+  // Recorder slot badges.
+  const slots = { r1: "slotAState", r2: "slotBState" };
+  for (const [rid, el] of Object.entries(slots)) {
+    const rec = (s.recorders || []).find((r) => r.id === rid);
+    const badge = $(el);
+    if (rec && rec.alive) {
+      badge.className = "badge on";
+      badge.textContent = `运行中 pid=${rec.pid} · ${rec.sensor}`;
+    } else {
+      badge.className = "badge off";
+      badge.textContent = "未运行";
+    }
+  }
+}
+
+function connStateBadge(c) {
+  if (c.closed) return '<span class="badge off">已关闭</span>';
+  if (c.pause_pending) return '<span class="badge busy">生效中…</span>';
+  if (c.paused) return '<span class="badge paused">已暂停</span>';
+  return '<span class="badge on">收数中</span>';
+}
+
+function renderConnections(s) {
+  const tb = $("connBody");
+  const handover = !!s.handover_in_progress;
+  $("connHint").className = "hint" + (handover ? " show" : "");
+  const conns = s.connections || [];
+  if (!conns.length) {
+    tb.innerHTML = '<tr><td colspan="6" class="small">尚无连接</td></tr>';
+    return;
+  }
+  tb.innerHTML = "";
+  for (const c of conns) {
+    const tr = document.createElement("tr");
+    if (c.paused && !c.closed) tr.className = "connrow-paused";
+    const label = `${c.peer}${c.sensor ? `<br><span class="small">${c.sensor}</span>` : ""}`;
+    let action = '<span class="small">—</span>';
+    if (!c.closed) {
+      const verb = c.paused ? "恢复收数" : "暂停收数";
+      const cls = c.paused ? "" : "warn";
+      action = `<button class="${cls}" data-peer="${c.peer}" data-paused="${c.paused ? 1 : 0}"
+        ${handover || c.pause_pending ? "disabled" : ""}
+        title="${handover ? "交接中，暂不能生效，请稍后重试" : ""}">${verb}</button>`;
+    }
+    tr.innerHTML = `<td>${label}</td><td>${connStateBadge(c)}</td>
+      <td><b>${c.ack_count}</b></td><td>${c.last_ack_id ?? "—"}</td>
+      <td>${c.leftover_bytes ?? 0}</td><td>${action}</td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("button[data-peer]").forEach((btn) => {
+    btn.addEventListener("click", () => pauseResume(btn.dataset.peer, btn.dataset.paused !== "1"));
+  });
+}
+
+async function pauseResume(peer, wantPause) {
+  try {
+    const r = await api(`/api/connections/${wantPause ? "pause" : "resume"}`, {
+      method: "POST",
+      body: JSON.stringify({ peer }),
+    });
+    toast(wantPause ? `已请求暂停 ${r.peer}（生效以事件确认为准）` : `已请求恢复 ${r.peer}`);
+  } catch (err) {
+    toast(err.retry ? `${err.message}` : `操作失败：${err.message}`, true);
+  }
 }
 
 function appendEvents(events) {
@@ -81,10 +150,15 @@ function appendEvents(events) {
       case "conn_accepted": cls = ""; body = `接受记录仪连接 ${e.peer}`; break;
       case "conn_closed": cls = ""; body = `记录仪关闭连接 ${e.peer ?? ""}`; break;
       case "conn_error": cls = "err"; body = `连接异常 ${e.peer ?? ""}`; break;
+      case "conn_paused": cls = "warn";
+        body = `连接 ${e.peer} 已暂停收数（缓冲区半行 ${e.leftover_bytes ?? 0} 字节保留）`; break;
+      case "conn_resumed": cls = "ok";
+        body = `连接 ${e.peer} 已恢复收数（续接缓冲区 ${e.leftover_bytes ?? 0} 字节）`; break;
+      case "pause_nack": cls = "err"; body = `暂停/恢复未生效：${e.reason}（${e.peer}）`; break;
       case "duplicate_ack": cls = "err"; body = `重复确认 #${e.id}（${e.first_version} 已确认，${e.dup_version} 又确认）`; break;
       case "supervisor_log": cls = ""; body = e.msg; break;
-      case "recorder_log": cls = ""; body = `[记录仪] ${e.msg}`; break;
-      case "recorder_exited": cls = ""; body = `[记录仪] 退出 rc=${e.rc}`; break;
+      case "recorder_log": cls = ""; body = `[记录仪 ${e.recorder ?? ""}] ${e.msg}`; break;
+      case "recorder_exited": cls = ""; body = `[记录仪 ${e.recorder ?? ""}] 退出 rc=${e.rc}`; break;
       case "log": cls = ""; body = `[采集进程 ${e.version}] ${e.msg}`; break;
       case "exiting": cls = ""; body = `采集进程 ${e.version} 退出中`; break;
       case "bad_line": cls = "err"; body = `无法解析的行：${e.error}`; break;
@@ -149,6 +223,7 @@ async function poll() {
       fetch("/api/verify").then((r) => r.json()),
     ]);
     renderStatus(s);
+    renderConnections(s);
     if (ev.events.length) appendEvents(ev.events);
     cursor = ev.cursor;
     renderVerify(v);
@@ -157,24 +232,34 @@ async function poll() {
   }
 }
 
-$("recForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await api("/api/recorder/start", {
-      method: "POST",
-      body: JSON.stringify({
-        count: +$("rCount").value,
-        interval: +$("rInterval").value,
-        gap_at: +$("rGapAt").value,
-        gap_seconds: +$("rGapSec").value,
-      }),
-    });
-    toast("记录仪已启动：只建立一次 TCP 连接");
-  } catch (err) { toast(err.message, true); }
-});
+function wireRecorderForm(slot, formId) {
+  $(formId).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("/api/recorder/start", {
+        method: "POST",
+        body: JSON.stringify({
+          count: +$(`rCount${slot}`).value,
+          interval: +$(`rInterval${slot}`).value,
+          gap_at: +$(`rGapAt${slot}`).value,
+          gap_seconds: +$(`rGapSec${slot}`).value,
+          recorder_id: slot === "A" ? "r1" : "r2",
+        }),
+      });
+      toast(`记录仪 ${r.recorder_id} 已启动（${r.sensor}）：只建立一次 TCP 连接`);
+    } catch (err) { toast(err.message, true); }
+  });
+}
 
-$("btnStopRec").addEventListener("click", async () => {
-  try { await api("/api/recorder/stop", { method: "POST" }); toast("已停止记录仪"); }
+wireRecorderForm("A", "recFormA");
+wireRecorderForm("B", "recFormB");
+
+$("btnStopA").addEventListener("click", async () => {
+  try { await api("/api/recorder/stop", { method: "POST", body: JSON.stringify({ recorder_id: "r1" }) }); toast("已停止记录仪 A"); }
+  catch (err) { toast(err.message, true); }
+});
+$("btnStopB").addEventListener("click", async () => {
+  try { await api("/api/recorder/stop", { method: "POST", body: JSON.stringify({ recorder_id: "r2" }) }); toast("已停止记录仪 B"); }
   catch (err) { toast(err.message, true); }
 });
 
